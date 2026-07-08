@@ -171,6 +171,35 @@ print(kenji.listening_streak)     # prints 1  ← bug (should be 13)
 
 **Control that isolates the trigger:** repeating the exact same one-day gap but landing on a Friday (`thursday → friday`) instead correctly returns `13`. The *only* changed variable is the day of week, which pins the defect to the `and today.weekday() != 6` clause at `services/streak_service.py:73`.
 
+**How I found the root cause:**
+
+1. Started at the entry point for a listen: `POST /songs/<song_id>/listen` in `routes/songs.py`, which calls `record_listening_event()`.
+2. Followed that into `services/streak_service.py`. `record_listening_event()` creates the `ListeningEvent` and delegates all streak math to `update_listening_streak(user, now)` — so the streak logic lives entirely in that one function.
+3. Read the function's docstring first (its spec): four rules, all defined purely by the day-*gap* between listens. None mention the day of the week.
+4. Read the branch logic underneath and immediately saw the mismatch: the increment `elif` carried an extra `and today.weekday() != 6` clause that had no counterpart anywhere in the spec.
+5. **The moment of confidence** wasn't just spotting a suspicious line — it was the control experiment. Holding the day-*gap* constant (1 day) and changing only the day of week flipped the result from `1` (Sunday) to `13` (Friday). Since `weekday()` is the function's *only* reference to day-of-week, that single-variable swing proved line 73 was the specific cause, not merely a suspect.
+
+**Root cause:**
+
+Python's `date.weekday()` returns `6` for Sunday (Monday = 0 … Sunday = 6). The streak-increment branch was written as `elif days_since_last == 1 and today.weekday() != 6:` — i.e. "increment only if this is a consecutive-day listen **and** today is not Sunday." Because this `elif` sits in an if/elif/else chain whose `else` branch is the catch-all reset (`user.listening_streak = 1`), the compound condition being `False` on Sundays didn't just skip the increment — it fell through to the reset. So a user who listened Saturday then Sunday (a genuine consecutive-day streak) had `days_since_last == 1` evaluate `True` but `weekday() != 6` evaluate `False`, making the whole `elif` `False`, dropping them into the `else` and wiping their streak to 1. The day-of-week check has no basis in the streak spec; it was extraneous logic that corrupted an otherwise-correct gap calculation.
+
+**Fix and side-effect check:**
+
+Removed the day-of-week clause so the increment depends only on the day-gap, matching the spec:
+
+```python
+# services/streak_service.py:73
+- elif days_since_last == 1 and today.weekday() != 6:
++ elif days_since_last == 1:
+      user.listening_streak += 1
+```
+
+This fixes the root cause because a consecutive-day listen now satisfies the `elif` on every day of the week, so it lands in the `+= 1` branch instead of falling through to the reset. Side-effects checked afterward:
+- **Same-day re-listen** (`days_since_last == 0`) — still returns early at the first `if`; untouched.
+- **Skipped 2+ days** (`days_since_last > 1`) — the `elif` was already `False` (gap ≠ 1), so it still correctly falls to the `else` reset; the removed clause never affected this path.
+- **Consecutive listen on a non-Sunday** — previously worked, still works (Thursday→Friday control still returns `13`).
+- Re-ran the reproduction: Case A (Sat→Sun) now prints `13` instead of `1`. No imports orphaned — `datetime`/`timezone` are still used elsewhere in the file.
+
 ### Issue #3 — The same song keeps showing up twice in search
 **Reported by:** simone
 
