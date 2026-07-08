@@ -286,4 +286,57 @@ Our collaborative playlist "Friday Energy" says it has 7 songs, but when I open 
 **Expected:** every song in the playlist is returned, including the newest.
 **Actual:** the most recently added song is always missing; adding another song "frees" the previous one and hides the new one instead.
 
-**How I reproduced it:** _(pending — not yet reproduced)_
+**How I reproduced it:**
+
+This one needs no timing or data manipulation — the seeded "Friday Energy" playlist triggers it directly. I compared the service's output against ground truth (the rows actually in the `playlist_entries` table). In the Flask shell:
+
+```python
+from app import create_app, db
+from models import Playlist, playlist_entries
+from services.playlist_service import get_playlist_songs
+
+app = create_app(); app.app_context().push()
+pl = Playlist.query.filter_by(name="Friday Energy").first()
+
+actual = db.session.execute(
+    playlist_entries.select().where(playlist_entries.c.playlist_id == pl.id)
+).fetchall()
+print("rows in playlist_entries:", len(actual))      # -> 7  (ground truth)
+print("get_playlist_songs count:", len(get_playlist_songs(pl.id)))  # -> 6  (bug)
+```
+
+Result: the playlist has **7** entries but the service returns **6**.
+
+**Trigger condition:** any playlist with ≥1 song — exactly one song is always dropped.
+
+**Which song, and why it confirms the report:** ordering the entries by `position` gives `[1,2,3,4,5,6,7]`, but the returned titles correspond to positions 1–6 only — the **highest-position** (most recently added) song is the one missing. This matches darius's "always the last one added": add another song and it becomes position 8, so the old position-7 song reappears and the new one is now the one hidden. The symptom points straight at how the function slices its result list at `services/playlist_service.py:66`.
+
+Also reproducible through the live app: `GET /playlists/<id>/songs` returns `"count": 6` for the same 7-song playlist.
+
+**How I found the root cause:**
+
+1. Started at the route `GET /playlists/<playlist_id>/songs` in `routes/playlists.py`, which calls `get_playlist_songs()`.
+2. Read `get_playlist_songs()` in `services/playlist_service.py` top to bottom. The query (lines 58–64) fetches every playlist song ordered by `position` ascending — correct, nothing dropped there.
+3. The very next line — the `return` at line 66 — sliced the result with `songs[:-1]`.
+4. **The moment of confidence** was matching the slice's behavior to the exact symptom. `[:-1]` drops precisely the last element of a list; the list is ordered by ascending position, so the last element is always the highest-position (most recently added) song. That is a one-to-one match with the reproduction (7 → 6, and specifically the position-7 song missing) and with darius's "always the last one added." No other line could produce *exactly one* missing song that is *always* the newest.
+
+**Root cause:**
+
+`get_playlist_songs()` correctly queried all of a playlist's songs ordered by `position`, but its return statement was `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice discards the final element of the list. Because the list is sorted by position ascending, the final element is always the most recently added song, so every playlist silently omitted its newest song. This directly violates the function's own docstring ("returns all songs in the playlist"); the slice served no purpose and was pure defect.
+
+**Fix and side-effect check:**
+
+Removed the slice so the full result set is returned:
+
+```python
+# services/playlist_service.py:66
+- return [song.to_dict() for song in songs[:-1]]
++ return [song.to_dict() for song in songs]
+```
+
+This fixes the root cause because the comprehension now iterates every queried song instead of stopping one short. Side-effects checked afterward:
+- **All seeded playlists** — each of the three now returns its full count (7/7) instead of dropping one.
+- **Ordering unchanged** — the `order_by(asc(position))` was untouched, so songs still come back in playlist order (confirmed by `test_playlist_returns_songs_in_order`).
+- **Empty playlist** — an empty playlist still returns `[]` (with the old `[:-1]`, `[][:-1]` was also `[]`, so no regression there).
+- **Test suite** — ran `pytest`: all 13 tests pass. `test_playlist_returns_all_songs` (which asserts a 5-song playlist returns 5, and was failing under the bug) now passes, along with the ordering and empty-playlist tests.
+- **Callers** — grepped `get_playlist_songs`: used by the `/playlists/<id>/songs` route (benefits from the fix) and imported-but-unused in `notification_service.add_to_playlist`. No caller relied on the truncated behavior.
