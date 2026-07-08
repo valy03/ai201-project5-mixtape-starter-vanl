@@ -200,20 +200,78 @@ This fixes the root cause because a consecutive-day listen now satisfies the `el
 - **Consecutive listen on a non-Sunday** — previously worked, still works (Thursday→Friday control still returns `13`).
 - Re-ran the reproduction: Case A (Sat→Sun) now prints `13` instead of `1`. No imports orphaned — `datetime`/`timezone` are still used elsewhere in the file.
 
-### Issue #3 — The same song keeps showing up twice in search
-**Reported by:** simone
+### Issue #2 — Friends Listening Now shows people from yesterday
+**Reported by:** nova
 
-When I search, some songs come back two or even three times — identical entries, same song. I searched "Anthem" and Crown Heights Anthem by Borough Kings showed up three times in the results. Other songs only show up once. Nothing about the duplicates looks different; it's just the same result repeated.
+"Friends Listening Now" is supposed to show me what my friends are playing right now — or at least what they've played today. This morning around 9am it showed darius "listening now" to a song he told me he played at 11pm last night, before he went to bed. He hadn't opened the app all morning. Stuff from yesterday evening keeps hanging around in the feed until the same time the next day.
 
 **Steps I took:**
 
-1. Searched for a song (`GET /songs/search?q=Anthem`).
-2. Counted the results.
+1. Opened my feed in the morning (`GET /feed/<my_id>/listening-now`).
+2. Cross-checked with darius: his last listen was the previous night.
 
-**Expected:** each matching song appears exactly once.
-**Actual:** some songs appear once, others two or three times, for a single-song match.
+**Expected:** only friends who have listened today appear.
+**Actual:** friends whose last listen was yesterday evening still show up the next morning.
 
-**How I reproduced it:** _(pending — not yet reproduced)_
+**How I reproduced it:**
+
+Like the streak bug, this is time-dependent: the feed compares each listen against `now`, and the `/listen` endpoint always stamps a listen as the current moment — so you can't trigger "a listen from last night" through the live API. You have to set up the **data condition**: a friend whose most recent listen was several hours ago and who hasn't listened since.
+
+First I confirmed the default seed *doesn't* show the bug — nova's three friends all have listens from the last ~30 minutes, so they legitimately belong in the feed (dedup keeps each friend's most recent listen). To expose the bug I recreated nova's exact story in the Flask shell: gave darius a single listen 10 hours ago and cleared his fresher seeded events.
+
+```python
+from datetime import datetime, timedelta, timezone
+from app import create_app, db
+from models import User, Song, ListeningEvent
+from services.feed_service import get_friends_listening_now
+
+app = create_app(); app.app_context().push()
+now = datetime.now(timezone.utc)
+nova   = User.query.filter_by(username="nova").first()
+darius = User.query.filter_by(username="darius").first()
+song   = Song.query.first()
+
+ListeningEvent.query.filter_by(user_id=darius.id).delete()
+db.session.add(ListeningEvent(user_id=darius.id, song_id=song.id,
+                              listened_at=now - timedelta(hours=10)))
+db.session.commit()
+
+shown = {r["friend"]["username"] for r in get_friends_listening_now(nova.id)}
+print("darius shown as 'listening NOW'?", "darius" in shown)   # -> True  (bug)
+```
+
+**Trigger condition:** a friend whose latest listen is between "a while ago" and 24 hours ago (here 10 h) still appears in "listening now."
+
+**Control that isolates the threshold:** re-running with the listen at **25 hours** ago prints `False` — darius drops out. Holding everything else constant and moving only the listen's age across the 24-hour mark flips the result, which pins the defect to the recency window (`RECENT_THRESHOLD`), not to the query or dedup logic.
+
+_(Re-seed with `python seed_data.py` afterward, since this modifies darius's listening events.)_
+
+**How I found the root cause:**
+
+1. Started at the feed route: `GET /feed/<user_id>/listening-now` in `routes/feed.py`, which calls `get_friends_listening_now()`.
+2. In `services/feed_service.py`, the function builds `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` (line 32) and keeps events where `listened_at >= cutoff` (line 42). So "recent" is defined entirely by that one constant.
+3. Traced `RECENT_THRESHOLD` to the top of the module (line 13): `timedelta(hours=24)`. That was the mismatch — a feature literally called "listening **now**" was admitting anything from the last full day.
+4. Cross-checked intent against the seed file: `seed_data.py:111` says recent events "within the past 30 minutes" should appear, and `:121` says older events "should NOT appear... after fix." So 24 hours was clearly wrong versus the documented ~30-minute intent.
+5. **The moment of confidence** was the boundary control: moving darius's only listen from 10 h (shown) to 25 h (hidden) and changing *nothing else* flipped his inclusion. That proved the recency window was the cause — not the query, the friend lookup, or the per-friend dedup.
+
+**Root cause:**
+
+The "Friends Listening Now" feed selects listening events with `listened_at >= now - RECENT_THRESHOLD`, and `RECENT_THRESHOLD` was set to `timedelta(hours=24)`. A 24-hour window means a listen from the previous evening (e.g. 10 hours ago) still satisfies the filter the next morning, so a friend who played something at 11pm and hasn't opened the app since keeps appearing as if they're listening *right now* — until a full 24 hours elapses. The window was simply far too wide for a real-time/"today" feature; the intended window (per the seed comments) is about 30 minutes.
+
+**Fix and side-effect check:**
+
+Changed the recency window from 24 hours to 30 minutes:
+
+```python
+# services/feed_service.py:13
+- RECENT_THRESHOLD = timedelta(hours=24)
++ RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+This fixes the root cause because the cutoff now excludes listens older than 30 minutes, so last night's activity no longer lingers into the next day. Side-effects checked afterward:
+- **Bug case** — a listen 10 hours ago is now excluded (`False`).
+- **No over-correction** — a listen 6 minutes ago still appears (`True`), so genuine current activity is preserved and the seed's 10–20-minute "recent" events still show.
+- **Blast radius** — grepped `RECENT_THRESHOLD`: it's referenced only at its definition and inside `get_friends_listening_now`. The sibling `get_activity_feed` intentionally has no recency filter (per its docstring) and is unaffected, so the general activity feed still returns the most recent events regardless of age.
 
 ### Issue #5 — The last song in a playlist never shows up
 **Reported by:** darius
