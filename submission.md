@@ -1,5 +1,16 @@
 # Mixtape — Project Submission
 
+## AI Usage
+
+I used an AI assistant (Claude Code) throughout this project, mostly as a navigation and debugging partner rather than a code generator — the actual code changes here are one to a few lines each, so the value was in *understanding* the app, not writing it.
+
+**Codebase navigation.** Before touching any bug I had the AI help me build the codebase map. I asked it to explain what `models.py` is responsible for, to trace how a song ends up in a friend's feed, and to describe the routes/services/models layering. It was genuinely useful for orienting quickly — e.g. it pointed out that the feed has no table of its own and is computed live from `ListeningEvent` rows, and that `playlist_entries` is a "rich" join table with a `position` column. I verified its claims by opening each file it referenced rather than taking the summary at face value; the map in this doc reflects what I confirmed by reading the source.
+
+**Debugging and reproduction.** The AI was most helpful in suggesting *how to reproduce* each bug. For the streak bug (#1) it explained that the bug depended on `datetime.now()`, so instead of waiting for a real Sunday I could call `update_listening_streak(user, now)` directly and inject a Sunday date — and it suggested running a Friday "control" to isolate the day-of-week as the trigger. For the feed bug (#2) it walked me through setting up a data condition (a listen timestamped hours in the past) since the `/listen` endpoint always stamps "now." For the playlist bug (#5) it suggested comparing the service's output against ground truth in the `playlist_entries` table. In every case I ran the reproductions myself in the Flask shell and pasted the actual output back — I did not rely on the AI's predicted results.
+
+**Where I had to verify, and where the AI was wrong.** This mattered, and the clearest example was the bug I *didn't* end up fixing. My original third choice was the "duplicate search results" bug. The AI confidently predicted that searching "Anthem" would return the same song three times because of an unnecessary `outerjoin(song_tags)` in the search query, and it wrote a reproduction that "should" print `count: 3`. When I ran it, I got `count: 1`. Its explanation was incomplete: it had reasoned about the raw SQL join but ignored that the code uses SQLAlchemy's legacy `db.session.query(Song)` API, which automatically de-duplicates full-entity results by primary key — so the join fan-out never reaches the caller. After I flagged the mismatch, it investigated properly and confirmed the raw join does produce 3 rows but the ORM collapses them to 1, meaning the reported symptom can't actually be reproduced through the app in this environment. Because of that I swapped that bug out for the "listening now shows yesterday" bug (#2), which reproduces cleanly. The lesson I took: the AI's *theory* was plausible and partly right, but only running the code myself revealed it was wrong in practice.
+
+
 ## 1. Codebase Map
 
 Mixtape is a **Flask JSON API** (no HTML frontend) for a music-sharing social app. Users share songs, rate them, add them to collaborative playlists, follow friends' listening activity, and build listening streaks. Data is stored in SQLite via SQLAlchemy.
